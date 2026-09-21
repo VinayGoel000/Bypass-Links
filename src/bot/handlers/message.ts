@@ -1,6 +1,7 @@
 import { Context } from "telegraf";
 import { validateUrl, extractUrl } from "../../security/url-validator.js";
 import { resolveUrl } from "../../resolver/url-resolver.js";
+import { bypassUrl } from "../../bypass/engine.js";
 import { checkReputation, SecurityStatus } from "../../security/reputation-service.js";
 import { MemoryCache } from "../../utils/cache.js";
 import { getEnvConfig } from "../../config/env.js";
@@ -8,42 +9,33 @@ import { logger } from "../../utils/logger.js";
 
 interface CachedResult {
   finalUrl: string;
-  redirectCount: number;
-  status: SecurityStatus;
-  chainFormatted: string;
+  method: string;
+  stepsCompleted: number;
 }
 
 const cache = new MemoryCache<CachedResult>(getEnvConfig().CACHE_TTL_SECONDS);
 
 function formatResponse(
   finalUrl: string,
-  redirectCount: number,
-  status: SecurityStatus,
-  chainFormatted: string
+  method: string,
+  stepsCompleted: number
 ): string {
-  const statusEmoji =
-    status === "SAFE_TO_VISIT"
-      ? "SAFE"
-      : status === "SUSPICIOUS"
-        ? "SUSPICIOUS"
-        : "UNKNOWN";
-
-  let msg = `Final destination:\n${finalUrl}\n\n`;
-  msg += `Redirects followed: ${redirectCount}\n`;
-  msg += `Security: ${statusEmoji}\n\n`;
-
-  if (redirectCount > 0) {
-    msg += `Redirect chain:\n${chainFormatted}`;
+  let msg = `🔗 Final Link:\n${finalUrl}\n\n`;
+  msg += `Method: ${method}\n`;
+  if (stepsCompleted > 0) {
+    msg += `Steps bypassed: ${stepsCompleted}\n`;
   }
-
   return msg;
 }
 
 export async function handleStart(ctx: Context): Promise<void> {
   await ctx.reply(
-    "Send me a URL and I will follow its redirects and show you the final destination.\n\n" +
-      "Supported: http:// and https:// links\n" +
-      "Example: https://short.example/abc"
+    "Send me any link shortener URL and I will bypass it to get the final link.\n\n" +
+      "Supported:\n" +
+      "- HTTP redirect chains (301/302/303/307/308)\n" +
+      "- Step-based shorteners (arolinks, gplinks, etc.)\n" +
+      "- Ad-wall bypass with timer wait\n\n" +
+      "Example: https://arolinks.com/xyz"
   );
 }
 
@@ -66,54 +58,77 @@ export async function handleUrlMessage(ctx: Context): Promise<void> {
   const urlKey = extracted.toLowerCase();
   const cached = cache.get(urlKey);
   if (cached) {
-    await ctx.reply(
-      formatResponse(
-        cached.finalUrl,
-        cached.redirectCount,
-        cached.status,
-        cached.chainFormatted
-      )
-    );
+    await ctx.reply(formatResponse(cached.finalUrl, `${cached.method} (cached)`, cached.stepsCompleted));
     return;
   }
 
-  const thinking = await ctx.reply("Resolving URL...");
+  const thinking = await ctx.reply("Checking URL...");
 
   try {
-    const result = await resolveUrl(extracted);
+    const httpResult = await resolveUrl(extracted);
 
-    if (!result.success) {
-      await ctx.reply(`Error: ${result.error}`);
+    if (httpResult.success && httpResult.chain.count > 0) {
+      logger.info("HTTP redirect chain resolved", { url: extracted, redirects: httpResult.chain.count });
+
+      const reputation = await checkReputation(httpResult.finalUrl!);
+
+      cache.set(urlKey, {
+        finalUrl: httpResult.finalUrl!,
+        method: "HTTP Redirect",
+        stepsCompleted: httpResult.chain.count,
+      });
+
+      const response = formatResponse(
+        httpResult.finalUrl!,
+        "HTTP Redirect",
+        httpResult.chain.count
+      );
+
+      await ctx.reply(response);
+
+      try {
+        if (thinking.chat && thinking.message_id) {
+          await ctx.telegram.deleteMessage(thinking.chat.id, thinking.message_id);
+        }
+      } catch {}
       return;
     }
 
-    const reputation = await checkReputation(result.finalUrl!);
+    await ctx.reply("Step-based link detected. Starting bypass engine...");
 
-    const formatted = formatResponse(
-      result.finalUrl!,
-      result.chain.count,
-      reputation.status,
-      result.chain.format()
-    );
+    const bypassResult = await bypassUrl(extracted);
 
-    cache.set(urlKey, {
-      finalUrl: result.finalUrl!,
-      redirectCount: result.chain.count,
-      status: reputation.status,
-      chainFormatted: result.chain.format(),
-    });
+    if (bypassResult.success && bypassResult.finalUrl) {
+      logger.info("Puppeteer bypass completed", {
+        url: extracted,
+        finalUrl: bypassResult.finalUrl,
+        steps: bypassResult.stepsCompleted,
+      });
 
-    await ctx.reply(formatted);
+      cache.set(urlKey, {
+        finalUrl: bypassResult.finalUrl,
+        method: "Puppeteer Bypass",
+        stepsCompleted: bypassResult.stepsCompleted,
+      });
 
-    try {
-      if (thinking.chat && thinking.message_id) {
-        await ctx.telegram.deleteMessage(thinking.chat.id, thinking.message_id);
-      }
-    } catch {
-      // Ignore delete errors
+      const response = formatResponse(
+        bypassResult.finalUrl,
+        "Puppeteer Bypass",
+        bypassResult.stepsCompleted
+      );
+
+      await ctx.reply(response);
+
+      try {
+        if (thinking.chat && thinking.message_id) {
+          await ctx.telegram.deleteMessage(thinking.chat.id, thinking.message_id);
+        }
+      } catch {}
+    } else {
+      await ctx.reply(`Bypass failed: ${bypassResult.error || "Could not resolve final link"}\n\nThe link may require manual interaction.`);
     }
   } catch (err) {
-    logger.error("Unhandled error in URL resolution", { error: String(err) });
+    logger.error("Unhandled error", { error: String(err) });
     await ctx.reply("An unexpected error occurred. Please try again later.");
   }
 }

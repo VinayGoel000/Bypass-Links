@@ -1,4 +1,5 @@
 import { createBot } from "./bot/bot.js";
+import { closeBrowser } from "./bypass/browser.js";
 import { logger } from "./utils/logger.js";
 
 async function main(): Promise<void> {
@@ -9,9 +10,10 @@ async function main(): Promise<void> {
   await bot.launch();
   logger.info("Bot is running (long polling mode)");
 
-  const shutdown = () => {
+  const shutdown = async () => {
     logger.info("Shutting down...");
     bot.stop();
+    await closeBrowser();
     process.exit(0);
   };
 
