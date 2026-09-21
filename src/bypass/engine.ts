@@ -1,267 +1,54 @@
+import { inspectHtml } from "./html-inspector.js";
 import { getBrowser } from "./browser.js";
 import { logger } from "../utils/logger.js";
 
 export interface BypassResult {
   success: boolean;
   finalUrl?: string;
+  method: string;
   stepsCompleted: number;
   error?: string;
   durationMs: number;
 }
 
-async function getStepInfo(page: any): Promise<{ current: number; total: number } | null> {
-  return page.evaluate(() => {
-    const body = document.body?.innerText || "";
+// ==================== APPROACH 1: HTML INSPECTION ====================
+// Fastest (1-3 sec), no browser needed
 
-    let m = body.match(/step\s*(\d+)\s*\/\s*(\d+)/i);
-    if (m) return { current: parseInt(m[1], 10), total: parseInt(m[2], 10) };
+async function tryHtmlInspection(url: string): Promise<BypassResult | null> {
+  const result = await inspectHtml(url);
 
-    m = body.match(/you\s+are\s+on\s+step\s*(\d+)/i);
-    if (m) return { current: parseInt(m[1], 10), total: 3 };
-
-    m = body.match(/(\d+)\s*\/\s*(\d+)/);
-    if (m) {
-      const c = parseInt(m[1], 10);
-      const t = parseInt(m[2], 10);
-      if (t >= 1 && t <= 10 && c <= t) return { current: c, total: t };
+  if (result.found && result.finalUrl) {
+    // Verify this URL is not the same as input or another shortener page
+    if (result.finalUrl !== url) {
+      logger.info("HTML inspection succeeded", { method: result.method, url: result.finalUrl });
+      return {
+        success: true,
+        finalUrl: result.finalUrl,
+        method: `HTML Inspection (${result.method})`,
+        stepsCompleted: 0,
+        durationMs: 0,
+      };
     }
+  }
 
-    return null;
-  });
+  return null;
 }
 
-async function waitForTimer(page: any, maxWaitSec: number = 30): Promise<void> {
-  const start = Date.now();
-  const maxMs = maxWaitSec * 1000;
+// ==================== APPROACH 2: TIMER SKIP + BUTTON CLICK ====================
+// Medium speed (5-10 sec), uses browser but skips timers
 
-  while (Date.now() - start < maxMs) {
-    const done = await page.evaluate(() => {
-      const body = document.body?.innerText || "";
-
-      if (/timer\s*(complete|ended|done|finished)/i.test(body)) return true;
-      if (/link\s+is\s+ready/i.test(body)) return true;
-      if (/click\s+to\s+continue/i.test(body)) return true;
-      if (/your\s+link\s+is\s+ready/i.test(body)) return true;
-      if (/get\s+link\s+button\s+has\s+been\s+enabled/i.test(body)) return true;
-
-      const timerEl = document.querySelector('[id*="timer"], [class*="timer"]');
-      if (timerEl) {
-        const t = timerEl.textContent || "";
-        if (/0[^.]|complete|done|ready/i.test(t)) return true;
-        if (/^\s*\d{1,2}\s*$/.test(t.trim())) {
-          const num = parseInt(t.trim(), 10);
-          if (num === 0) return true;
-        }
-      }
-
-      return false;
-    });
-
-    if (done) {
-      logger.info("Timer completed");
-      await new Promise((r) => setTimeout(r, 2000));
-      return;
-    }
-
-    const timerText = await page.evaluate(() => {
-      const timerEl = document.querySelector('[id*="timer"], [class*="timer"]');
-      return timerEl?.textContent?.trim() || "";
-    });
-
-    if (timerText) {
-      logger.debug("Timer text", { text: timerText });
-    }
-
-    await new Promise((r) => setTimeout(r, 2000));
-  }
-
-  logger.info("Timer wait timeout, continuing");
-}
-
-async function findAndClickGetLink(page: any): Promise<boolean> {
-  // Strategy 1: Find visible "Get Link" button by ID or class
-  const clicked1 = await page.evaluate(() => {
-    const selectors = [
-      '#getlink', '#get-link', '#get_link',
-      '[id*="getlink"]', '[id*="get-link"]', '[id*="get_link"]',
-      '.getlink', '.get-link', '.get_link',
-      '[class*="getlink"]', '[class*="get-link"]',
-      '#btn-get-link', '#btnGetLink',
-    ];
-
-    for (const sel of selectors) {
-      const el = document.querySelector(sel);
-      if (el) {
-        const rect = el.getBoundingClientRect();
-        const visible = rect.width > 0 && rect.height > 0;
-        if (visible) {
-          el.scrollIntoView();
-          (el as HTMLElement).click();
-          return true;
-        }
-      }
-    }
-    return false;
-  });
-
-  if (clicked1) {
-    logger.info("Clicked Get Link button by ID/class");
-    await new Promise((r) => setTimeout(r, 3000));
-    return true;
-  }
-
-  // Strategy 2: Find anchor/button with "Get Link" text that's visible
-  const clicked2 = await page.evaluate(() => {
-    const elements = document.querySelectorAll("a, button");
-    const patterns = /^(get\s*link|get\s+your\s+link|continue\s+to\s+link|proceed|skip\s+ad|visit\s+link)$/i;
-
-    for (const el of Array.from(elements)) {
-      const text = (el.textContent || "").trim();
-      if (patterns.test(text)) {
-        const rect = el.getBoundingClientRect();
-        const visible = rect.width > 0 && rect.height > 0;
-        const style = window.getComputedStyle(el);
-        const display = style.display;
-        const hidden = display === "none" || style.visibility === "hidden";
-
-        if (visible && !hidden) {
-          const href = el.tagName === "A" ? (el as HTMLAnchorElement).href : null;
-          if (href && href.startsWith("http")) {
-            window.location.href = href;
-            return "navigate";
-          }
-          (el as HTMLElement).click();
-          return "clicked";
-        }
-      }
-    }
-    return null;
-  });
-
-  if (clicked2 === "navigate") {
-    logger.info("Navigated via Get Link anchor");
-    await new Promise((r) => setTimeout(r, 3000));
-    return true;
-  }
-  if (clicked2 === "clicked") {
-    logger.info("Clicked Get Link button by text");
-    await new Promise((r) => setTimeout(r, 3000));
-    return true;
-  }
-
-  // Strategy 3: Find data-href on button-like elements
-  const clicked3 = await page.evaluate(() => {
-    const btns = document.querySelectorAll("a[data-href], button[data-href], div[data-href], span[data-href]");
-    for (const btn of Array.from(btns)) {
-      const rect = btn.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0) {
-        const href = btn.getAttribute("data-href");
-        if (href && href.startsWith("http")) {
-          window.location.href = href;
-          return true;
-        }
-      }
-    }
-    return false;
-  });
-
-  if (clicked3) {
-    logger.info("Navigated via data-href button");
-    await new Promise((r) => setTimeout(r, 3000));
-    return true;
-  }
-
-  // Strategy 4: Find the LAST large/visible link (likely the Get Link button)
-  const lastLink = await page.evaluate(() => {
-    const links = document.querySelectorAll("a[href]");
-    let bestLink: string | null = null;
-    let bestArea = 0;
-
-    for (const a of Array.from(links)) {
-      const href = (a as HTMLAnchorElement).href;
-      if (!href.startsWith("http")) continue;
-
-      const rect = a.getBoundingClientRect();
-      if (rect.width < 50 || rect.height < 20) continue;
-
-      const style = window.getComputedStyle(a);
-      if (style.display === "none" || style.visibility === "hidden") continue;
-
-      const area = rect.width * rect.height;
-      const text = (a.textContent || "").trim();
-
-      // Skip navigation links, footer links
-      if (/^(home|about|contact|privacy|terms|menu|logo)$/i.test(text)) continue;
-      if (text.length > 50) continue;
-
-      // Prefer buttons with action text
-      const isAction = /get|link|download|continue|proceed|visit|claim|open/i.test(text);
-
-      if (isAction || area > bestArea) {
-        bestArea = area;
-        bestLink = href;
-      }
-    }
-
-    return bestLink;
-  });
-
-  if (lastLink) {
-    logger.info("Found prominent link", { url: lastLink });
-    await page.goto(lastLink, { waitUntil: "domcontentloaded", timeout: 15000 });
-    await new Promise((r) => setTimeout(r, 3000));
-    return true;
-  }
-
-  return false;
-}
-
-async function pageChangedAfterReload(page: any, oldUrl: string): Promise<boolean> {
-  const currentUrl = page.url();
-
-  // Check if JS redirected us
-  if (currentUrl !== oldUrl) return true;
-
-  // Check if page content changed (step counter updated)
-  const contentHash = await page.evaluate(() => {
-    return document.body?.innerText?.substring(0, 500) || "";
-  });
-
-  await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
-  await new Promise((r) => setTimeout(r, 3000));
-
-  const newContentHash = await page.evaluate(() => {
-    return document.body?.innerText?.substring(0, 500) || "";
-  });
-
-  const newUrl = page.url();
-  if (newUrl !== oldUrl) return true;
-  if (contentHash !== newContentHash) return true;
-
-  return false;
-}
-
-export async function bypassUrl(url: string): Promise<BypassResult> {
-  const startTime = Date.now();
-  logger.info("Starting Puppeteer bypass", { url });
-
+async function tryTimerSkip(url: string): Promise<BypassResult | null> {
   let browser;
   try {
     browser = await getBrowser();
-  } catch (err) {
-    return {
-      success: false,
-      error: `Browser launch failed: ${(err as Error).message}`,
-      stepsCompleted: 0,
-      durationMs: Date.now() - startTime,
-    };
+  } catch {
+    return null;
   }
 
   let page: any = null;
 
   try {
     page = await browser.newPage();
-
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     );
@@ -277,77 +64,280 @@ export async function bypassUrl(url: string): Promise<BypassResult> {
       }
     });
 
-    logger.info("Navigating to URL", { url });
+    // Override Date.now() to skip timers
+    await page.evaluateOnNewDocument(() => {
+      const offset = 60000; // 60 seconds offset
+      const originalNow = Date.now;
+      (Date as any).now = () => originalNow() + offset;
+
+      // Clear all existing timers
+      for (let i = 1; i < 99999; i++) {
+        clearTimeout(i);
+        clearInterval(i);
+      }
+    });
+
+    logger.info("Timer skip: navigating", { url });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+    await new Promise((r) => setTimeout(r, 2000));
+
+    // Inject script to override timers after page load too
+    await page.evaluate(() => {
+      // Override Date.now
+      const offset = 60000;
+      const originalNow = Date.now;
+      (Date as any).now = () => originalNow() + offset;
+
+      // Override setTimeout to fire immediately
+      const originalSetTimeout = window.setTimeout;
+      (window as any).setTimeout = (fn: Function, ms: number) => {
+        if (ms > 1000) {
+          return originalSetTimeout(fn, 10); // Fire almost immediately
+        }
+        return originalSetTimeout(fn, ms);
+      };
+
+      // Override setInterval
+      const originalSetInterval = window.setInterval;
+      (window as any).setInterval = (fn: Function, ms: number) => {
+        return originalSetInterval(fn, Math.min(ms, 100));
+      };
+    });
+
+    await new Promise((r) => setTimeout(r, 2000));
+
+    let stepsCompleted = 0;
+    const maxSteps = 10;
+
+    for (let step = 0; step < maxSteps; step++) {
+      const currentUrl = page.url();
+
+      // Check for step indicator
+      const hasStep = await page.evaluate(() => {
+        const body = document.body?.innerText || "";
+        return /step\s*\d+\s*\/\s*\d+/i.test(body) || /you\s+are\s+on\s+step/i.test(body);
+      });
+
+      if (!hasStep) {
+        logger.info("Timer skip: no step indicator, checking final page");
+        break;
+      }
+
+      logger.info("Timer skip: step detected", { step: step + 1 });
+
+      // Try clicking Get Link button
+      const clicked = await page.evaluate(() => {
+        const selectors = [
+          '#getlink', '#get-link', '#get_link',
+          '[id*="getlink"]', '[id*="get-link"]',
+          '.getlink', '.get-link',
+        ];
+
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          if (el) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+              (el as HTMLElement).click();
+              return true;
+            }
+          }
+        }
+
+        const btns = document.querySelectorAll("a, button");
+        for (const btn of Array.from(btns)) {
+          const text = (btn.textContent || "").trim();
+          if (/^get\s*link$/i.test(text)) {
+            const rect = btn.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+              const href = btn.tagName === "A" ? (btn as HTMLAnchorElement).href : null;
+              if (href && href.startsWith("http")) {
+                window.location.href = href;
+                return true;
+              }
+              (btn as HTMLElement).click();
+              return true;
+            }
+          }
+        }
+
+        return false;
+      });
+
+      if (clicked) {
+        await new Promise((r) => setTimeout(r, 3000));
+        stepsCompleted++;
+
+        if (page.url() !== currentUrl) {
+          continue;
+        }
+      }
+
+      // Try reload
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
+      await new Promise((r) => setTimeout(r, 2000));
+
+      if (page.url() !== currentUrl) {
+        stepsCompleted++;
+        continue;
+      }
+
+      break;
+    }
+
+    const finalUrl = page.url();
+
+    // Verify it's not the same as input
+    if (finalUrl === url) {
+      return null;
+    }
+
+    logger.info("Timer skip: completed", { url: finalUrl, steps: stepsCompleted });
+    return {
+      success: true,
+      finalUrl,
+      method: "Timer Skip + Browser",
+      stepsCompleted,
+      durationMs: 0,
+    };
+  } catch (err) {
+    logger.error("Timer skip failed", { error: (err as Error).message });
+    return null;
+  } finally {
+    if (page) await page.close().catch(() => {});
+  }
+}
+
+// ==================== APPROACH 3: FULL BROWSER FLOW ====================
+// Slowest (15-30 sec), handles complex multi-step flows
+
+async function tryFullBrowser(url: string): Promise<BypassResult> {
+  let browser;
+  try {
+    browser = await getBrowser();
+  } catch (err) {
+    return {
+      success: false,
+      error: `Browser launch failed: ${(err as Error).message}`,
+      method: "Full Browser",
+      stepsCompleted: 0,
+      durationMs: 0,
+    };
+  }
+
+  let page: any = null;
+
+  try {
+    page = await browser.newPage();
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    );
+    await page.setViewport({ width: 1920, height: 1080 });
+
+    await page.setRequestInterception(true);
+    page.on("request", (req: any) => {
+      const type = req.resourceType();
+      if (["image", "media", "font", "stylesheet"].includes(type)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
+    logger.info("Full browser: navigating", { url });
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
     await new Promise((r) => setTimeout(r, 3000));
 
     let stepsCompleted = 0;
     const maxSteps = 10;
-    let lastUrl = page.url();
 
     for (let step = 0; step < maxSteps; step++) {
       const currentUrl = page.url();
-      logger.info("Processing step", { step: step + 1, url: currentUrl });
 
-      const stepInfo = await getStepInfo(page);
+      const hasStep = await page.evaluate(() => {
+        const body = document.body?.innerText || "";
+        return /step\s*\d+\s*\/\s*\d+/i.test(body) || /you\s+are\s+on\s+step/i.test(body);
+      });
 
-      if (!stepInfo) {
-        // No step indicator - check if this is truly the final page
-        logger.info("No step indicator found");
-        const clicked = await findAndClickGetLink(page);
-        if (clicked && page.url() !== currentUrl) {
-          stepsCompleted++;
-          await new Promise((r) => setTimeout(r, 2000));
-          continue;
-        }
-        logger.info("Reached final page", { url: page.url() });
+      if (!hasStep) {
+        logger.info("Full browser: no step indicator");
         break;
       }
 
-      logger.info("Step detected", { current: stepInfo.current, total: stepInfo.total });
+      logger.info("Full browser: step", { step: step + 1 });
 
-      // Wait for timer
-      await waitForTimer(page);
+      // Wait for timer (real wait)
+      await page.waitForFunction(
+        () => {
+          const body = document.body?.innerText || "";
+          if (/please\s+wait/i.test(body) && !/complete|ended|ready/i.test(body)) return false;
+          const timerEl = document.querySelector('[id*="timer"], [class*="timer"]');
+          if (timerEl) {
+            const t = timerEl.textContent || "";
+            if (/\d+/.test(t) && !/0|complete|done/i.test(t)) return false;
+          }
+          return true;
+        },
+        { timeout: 30000, polling: 1000 }
+      ).catch(() => {});
 
-      // After timer, try clicking Get Link button
-      const clicked = await findAndClickGetLink(page);
+      await new Promise((r) => setTimeout(r, 2000));
+
+      // Click Get Link
+      const clicked = await page.evaluate(() => {
+        const selectors = [
+          '#getlink', '#get-link', '#get_link',
+          '[id*="getlink"]', '[id*="get-link"]',
+          '.getlink', '.get-link',
+        ];
+
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          if (el) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+              (el as HTMLElement).click();
+              return true;
+            }
+          }
+        }
+
+        const btns = document.querySelectorAll("a, button");
+        for (const btn of Array.from(btns)) {
+          const text = (btn.textContent || "").trim();
+          if (/^get\s*link$/i.test(text)) {
+            const rect = btn.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+              const href = btn.tagName === "A" ? (btn as HTMLAnchorElement).href : null;
+              if (href && href.startsWith("http")) {
+                window.location.href = href;
+                return true;
+              }
+              (btn as HTMLElement).click();
+              return true;
+            }
+          }
+        }
+
+        return false;
+      });
 
       if (clicked) {
-        const newUrl = page.url();
-        if (newUrl !== currentUrl) {
-          logger.info("Step completed - navigated to", { url: newUrl });
-          stepsCompleted++;
-          lastUrl = newUrl;
-          await new Promise((r) => setTimeout(r, 2000));
-          continue;
-        }
+        await new Promise((r) => setTimeout(r, 3000));
+        stepsCompleted++;
+
+        if (page.url() !== currentUrl) continue;
       }
 
-      // If button click didn't navigate, try reload to trigger JS redirect
-      logger.info("Trying page reload to trigger JS redirect");
-      const changed = await pageChangedAfterReload(page, currentUrl);
+      // Reload
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
+      await new Promise((r) => setTimeout(r, 2000));
 
-      if (changed) {
-        logger.info("Page changed after reload", { url: page.url() });
+      if (page.url() !== currentUrl) {
         stepsCompleted++;
-        lastUrl = page.url();
-        await new Promise((r) => setTimeout(r, 2000));
         continue;
       }
 
-      // Last resort: wait more and try button again
-      logger.info("Waiting additional time for page update");
-      await new Promise((r) => setTimeout(r, 5000));
-
-      const retryClicked = await findAndClickGetLink(page);
-      if (retryClicked && page.url() !== currentUrl) {
-        stepsCompleted++;
-        lastUrl = page.url();
-        await new Promise((r) => setTimeout(r, 2000));
-        continue;
-      }
-
-      logger.info("No progress possible, stopping");
       break;
     }
 
@@ -356,20 +346,48 @@ export async function bypassUrl(url: string): Promise<BypassResult> {
     return {
       success: true,
       finalUrl,
+      method: "Full Browser",
       stepsCompleted,
-      durationMs: Date.now() - startTime,
+      durationMs: 0,
     };
   } catch (err) {
-    logger.error("Bypass error", { error: (err as Error).message });
     return {
       success: false,
       error: (err as Error).message,
+      method: "Full Browser",
       stepsCompleted: 0,
-      durationMs: Date.now() - startTime,
+      durationMs: 0,
     };
   } finally {
-    if (page) {
-      await page.close().catch(() => {});
-    }
+    if (page) await page.close().catch(() => {});
   }
+}
+
+// ==================== MAIN HYBRID FUNCTION ====================
+
+export async function bypassUrl(url: string): Promise<BypassResult> {
+  const startTime = Date.now();
+  logger.info("Starting hybrid bypass", { url });
+
+  // APPROACH 1: HTML Inspection (fastest - 1-3 sec)
+  logger.info("Trying HTML inspection...");
+  const htmlResult = await tryHtmlInspection(url);
+  if (htmlResult) {
+    htmlResult.durationMs = Date.now() - startTime;
+    return htmlResult;
+  }
+
+  // APPROACH 2: Timer Skip + Browser (medium - 5-10 sec)
+  logger.info("Trying timer skip...");
+  const timerResult = await tryTimerSkip(url);
+  if (timerResult) {
+    timerResult.durationMs = Date.now() - startTime;
+    return timerResult;
+  }
+
+  // APPROACH 3: Full Browser (slow - 15-30 sec)
+  logger.info("Falling back to full browser flow...");
+  const fullResult = await tryFullBrowser(url);
+  fullResult.durationMs = Date.now() - startTime;
+  return fullResult;
 }
