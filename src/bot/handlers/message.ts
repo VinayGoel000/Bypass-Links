@@ -1,7 +1,9 @@
 import { Context } from "telegraf";
 import { validateUrl, extractUrl } from "../../security/url-validator.js";
 import { resolveUrl } from "../../resolver/url-resolver.js";
+import { inspectHtml } from "../../bypass/html-inspector.js";
 import { bypassUrl } from "../../bypass/engine.js";
+import { resolveAndValidate } from "../../security/ssrf-protection.js";
 import { checkReputation } from "../../security/reputation-service.js";
 import { MemoryCache } from "../../utils/cache.js";
 import { getEnvConfig } from "../../config/env.js";
@@ -79,8 +81,37 @@ export async function handleUrlMessage(ctx: Context): Promise<void> {
       return;
     }
 
-    // Try hybrid bypass (HTML inspection + browser)
-    await ctx.reply("Step-based link detected. Trying bypass...");
+    // Then try HTML inspection (fast, no browser needed)
+    const inspectResult = await inspectHtml(extracted);
+    if (inspectResult.found && inspectResult.finalUrl) {
+      const foundValidation = validateUrl(inspectResult.finalUrl);
+      if (foundValidation.valid && foundValidation.url) {
+        const ssrf = await resolveAndValidate(foundValidation.url.hostname);
+        if (ssrf.safe) {
+          const method = `HTML Inspection (${inspectResult.method})`;
+          cache.set(urlKey, {
+            finalUrl: inspectResult.finalUrl,
+            method,
+            stepsCompleted: 0,
+          });
+
+          await ctx.reply(formatResponse(inspectResult.finalUrl, method, 0));
+          try {
+            if (thinking.chat && thinking.message_id) {
+              await ctx.telegram.deleteMessage(thinking.chat.id, thinking.message_id);
+            }
+          } catch {}
+          return;
+        }
+        logger.warn("HTML inspection hit SSRF-blocked URL", {
+          url: inspectResult.finalUrl,
+          error: ssrf.error,
+        });
+      }
+    }
+
+    // Finally try browser bypass (handles timers / multi-step pages)
+    await ctx.reply("Step-based link detected. Trying browser bypass...");
 
     const bypassResult = await bypassUrl(extracted);
 

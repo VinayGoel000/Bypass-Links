@@ -218,6 +218,20 @@ export async function bypassUrl(url: string): Promise<BypassResult> {
       // Wait for timer and click Get Link
       const moved = await waitAndGetLink(page);
 
+      // The click may have opened the link in a new tab (target="_blank")
+      const pages = await browser.pages();
+      const newTab = pages.find(
+        (p: any) => p !== page && /^https?:\/\//.test(p.url())
+      );
+      if (newTab) {
+        logger.info("New tab detected, switching to it", { url: newTab.url() });
+        await page.close().catch(() => {});
+        page = newTab;
+        stepsCompleted++;
+        await new Promise((r) => setTimeout(r, 2000));
+        continue;
+      }
+
       if (page.url() !== currentUrl) {
         logger.info("Moved to next page", { url: page.url() });
         stepsCompleted++;
