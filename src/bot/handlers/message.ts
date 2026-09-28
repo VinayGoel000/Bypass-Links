@@ -110,10 +110,32 @@ export async function handleUrlMessage(ctx: Context): Promise<void> {
       }
     }
 
-    // Finally try browser bypass (handles timers / multi-step pages)
-    await ctx.reply("Step-based link detected. Trying browser bypass...");
+    // Finally try browser bypass (handles timers / multi-step pages).
+    // Progress is streamed by editing the "thinking" message (throttled
+    // to stay under Telegram's edit rate limits).
+    let lastEditAt = 0;
+    let lastProgressText = "";
+    const onProgress = async (p: { step: number; message: string }) => {
+      const text = `Bypassing… ${p.message}`;
+      const now = Date.now();
+      if (text === lastProgressText || now - lastEditAt < 3000) return;
+      lastProgressText = text;
+      lastEditAt = now;
+      try {
+        await ctx.telegram.editMessageText(
+          thinking.chat.id,
+          thinking.message_id,
+          undefined,
+          text
+        );
+      } catch {
+        // Message may be unchanged or too old; not fatal.
+      }
+    };
 
-    const bypassResult = await bypassUrl(extracted);
+    const bypassResult = await bypassUrl(extracted, (p) => {
+      void onProgress(p);
+    });
 
     if (bypassResult.success && bypassResult.finalUrl) {
       cache.set(urlKey, {
