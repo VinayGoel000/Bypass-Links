@@ -7,7 +7,8 @@
 
 /** Regex sources (no flags) matched against a button's visible text. */
 export const ACTION_TEXT_PATTERNS: string[] = [
-  String.raw`^get\s*(your\s*)?links?$`, // Get Link / Get Your Link
+  String.raw`^get\s*(your\s*)?links?(\s*-\s*download)?$`, // Get Link / Get Link - Download
+  String.raw`click\s+here\s+to\s+get\s+link`, // Click here to Get Link (substring)
   String.raw`^click\s+here\s+to\s+continue$`, // Click here to continue
   String.raw`^continue(\s+to(\s+(the\s+)?links?)?)?$`, // Continue / Continue to Link
   String.raw`^proceed(\s+to(\s+link)?)?$`, // Proceed
